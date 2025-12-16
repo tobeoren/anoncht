@@ -1,229 +1,198 @@
 const express = require('express');
 const http = require('http');
 const { Server } = require("socket.io");
-const crypto = require('crypto'); // Library untuk Hash IP
+const crypto = require('crypto');
 
 const app = express();
 const server = http.createServer(app);
 
-// Konfigurasi CORS agar bisa diakses dari Netlify
+// Konfigurasi CORS & Limit Payload
 const io = new Server(server, {
-    cors: {
-        origin: "*", // Mengizinkan akses dari mana saja (Netlify)
-        methods: ["GET", "POST"]
-    },
-    maxHttpBufferSize: 1e6 // Max 1 MB
+    cors: { origin: "*", methods: ["GET", "POST"] },
+    maxHttpBufferSize: 5e6 // Limit 5MB (Cukup untuk dokumen/voice note)
 });
 
-app.get('/', (req, res) => {
-    res.send("Server AnonChat berjalan! Silakan buka Frontend di Netlify.");
-});
+app.get('/', (req, res) => res.send("Server Hybrid (Random + Room) Berjalan."));
 
-// --- KONFIGURASI ---
-const RATE_LIMIT_MS = 500;
-const BAD_WORDS = ["kasar", "bodoh", "anjing", "stupid"];
+// --- DATABASE MEMORY ---
+let queue = {}; // Random Queue: { 'Indonesia': [socketId1, ...] }
+let users = {}; // User Data
+let bannedIPs = new Set(); 
 
-// --- DATABASE SEMENTARA (MEMORY) ---
-let queue = {}; 
-let users = {}; 
-let bannedIPs = new Set(); // Daftar IP yang di-banned (Hash)
-
-// --- FUNGSI BANTUAN ---
-function escapeHtml(text) {
-    if (!text) return text;
-    return text.replace(/[&<>"']/g, (m) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;' })[m]);
-}
-
-function filterBadWords(text) {
-    let cleanText = text;
-    BAD_WORDS.forEach(word => {
-        const regex = new RegExp(`\\b${word}\\b`, "gi");
-        cleanText = cleanText.replace(regex, "***");
-    });
-    return cleanText;
-}
-
-// Fungsi Hash IP (Mengubah IP jadi kode acak agar privasi terjaga)
+// Hash IP untuk Privasi
 function getIpHash(socket) {
     const ip = socket.handshake.headers['x-forwarded-for'] || socket.handshake.address;
     return crypto.createHash('sha256').update(ip).digest('hex');
 }
 
+// Anti XSS Sederhana
+function escapeHtml(text) {
+    return text ? text.replace(/[&<>"']/g, m => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;' })[m]) : text;
+}
+
 io.on('connection', (socket) => {
-    // 1. CEK STATUS BANNED (IP Hashing System)
     const userIpHash = getIpHash(socket);
+
+    // 1. CEK BANNED
     if (bannedIPs.has(userIpHash)) {
-        socket.emit('system_message', '🚫 Perangkat Anda telah diblokir permanen dari server.');
+        socket.emit('system_message', '🚫 Akses Ditolak: Perangkat diblokir.');
         socket.disconnect(true);
         return;
     }
 
-    // 2. Update Counter
     io.emit('update_user_count', io.engine.clientsCount);
 
-    // 3. User Mencari Teman
-    socket.on('find_match', ({ nickname, country, interests }) => {
-        // Parse minat
-        const interestList = typeof interests === 'string' ? interests.split(',').map(i => i.trim().toLowerCase()).filter(i => i) : [];
+    // --- MODE A: RANDOM MATCHMAKING ---
+    socket.on('find_random_match', ({ nickname, country, interests }) => {
+        // Reset state jika user sebelumnya di room
+        leaveCurrentState(socket);
 
         users[socket.id] = { 
             nickname: escapeHtml(nickname), 
-            country: country, 
-            interests: interestList,
+            country, 
+            interests: typeof interests === 'string' ? interests.toLowerCase().split(',') : [],
+            mode: 'random',
             partner: null,
-            revealed: false,
-            lastMessageTime: 0,
-            reportCount: 0, // Untuk sistem ban otomatis
-            ipHash: userIpHash
+            ipHash: userIpHash,
+            reportCount: 0
         };
-
-        findPartner(socket.id, country, interestList);
+        findRandomPartner(socket.id, country, users[socket.id].interests);
     });
 
-    function findPartner(socketId, country, myInterests) {
+    function findRandomPartner(socketId, country, myInterests) {
         if (!queue[country]) queue[country] = [];
-        
         let matchIndex = -1;
 
         // Prioritas: Minat Sama
         if (myInterests.length > 0) {
-            matchIndex = queue[country].findIndex(waitingId => {
-                const waiter = users[waitingId];
-                if (!waiter) return false;
-                const common = waiter.interests.filter(x => myInterests.includes(x));
-                return common.length > 0;
+            matchIndex = queue[country].findIndex(id => {
+                const waiter = users[id];
+                return waiter && waiter.interests.some(x => myInterests.includes(x));
             });
         }
-
         // Fallback: Siapa saja
-        if (matchIndex === -1 && queue[country].length > 0) {
-            matchIndex = 0;
-        }
+        if (matchIndex === -1 && queue[country].length > 0) matchIndex = 0;
 
         if (matchIndex > -1) {
             const partnerId = queue[country].splice(matchIndex, 1)[0];
-            
             if (users[partnerId]) {
+                // Link Users
                 users[socketId].partner = partnerId;
                 users[partnerId].partner = socketId;
-
-                const partnerInterests = users[partnerId].interests;
-                const commonTags = partnerInterests.filter(x => myInterests.includes(x));
-
-                io.to(socketId).emit('chat_start', { role: 'initiator', commonTags });
-                io.to(partnerId).emit('chat_start', { role: 'receiver', commonTags });
+                
+                io.to(socketId).emit('chat_start', { mode: 'random', role: 'initiator' });
+                io.to(partnerId).emit('chat_start', { mode: 'random', role: 'receiver' });
             } else {
-                findPartner(socketId, country, myInterests);
+                findRandomPartner(socketId, country, myInterests); // Retry jika partner disconnect
             }
         } else {
             queue[country].push(socketId);
-            socket.emit('waiting', `Mencari teman di ${country}...`);
+            socket.emit('waiting', `Mencari partner random di ${country}...`);
         }
     }
 
-    // 4. Relay Pesan
-    socket.on('send_message', (msg) => {
-        const user = users[socket.id];
-        if (!user || !user.partner) return;
+    // --- MODE B: ROOM CHAT ---
+    socket.on('join_room', ({ roomCode, nickname }) => {
+        leaveCurrentState(socket);
 
-        // Rate Limit
-        const now = Date.now();
-        if (now - user.lastMessageTime < RATE_LIMIT_MS) return; 
-        user.lastMessageTime = now;
+        const roomID = roomCode.trim().toUpperCase();
+        socket.join(roomID);
+        
+        users[socket.id] = { 
+            nickname: escapeHtml(nickname), 
+            room: roomID, 
+            mode: 'room',
+            ipHash: userIpHash,
+            reportCount: 0
+        };
 
-        // Filter kata kasar (Hanya jika pesan BUKAN enkripsi E2EE)
-        let safeMsg = msg;
-        if (!msg.startsWith("ENC:")) {
-            safeMsg = filterBadWords(escapeHtml(msg));
+        socket.to(roomID).emit('system_message', `👋 ${nickname} bergabung.`);
+        
+        // P2P Sync Trigger (Minta history ke user lama)
+        const clients = io.sockets.adapter.rooms.get(roomID);
+        if (clients && clients.size > 1) {
+            const otherSocketId = [...clients].find(id => id !== socket.id);
+            if(otherSocketId) io.to(otherSocketId).emit('request_history_sync', { requesterId: socket.id });
         }
-
-        io.to(user.partner).emit('receive_message', { msg: safeMsg, sender: user.revealed ? user.nickname : 'Stranger', type: 'text' });
-        socket.emit('receive_message', { msg: safeMsg, sender: 'You', isSelf: true, type: 'text' });
+        
+        socket.emit('chat_start', { mode: 'room', roomName: roomID });
     });
 
-    // 5. Relay Gambar
-    socket.on('send_image', (imgData) => {
+    // --- UNIVERSAL MESSAGING ---
+    socket.on('send_message', (data) => {
         const user = users[socket.id];
-        if (user && user.partner) {
-            io.to(user.partner).emit('receive_message', { msg: imgData, sender: user.revealed ? user.nickname : 'Stranger', type: 'image' });
-            socket.emit('receive_message', { msg: imgData, sender: 'You', isSelf: true, type: 'image' });
+        if (!user) return;
+
+        const payload = {
+            msg: data.msg,
+            sender: user.nickname,
+            type: data.type || 'text',
+            fileData: data.fileData,
+            timer: data.timer // Untuk fitur Burn Message
+        };
+
+        if (user.mode === 'random' && user.partner) {
+            io.to(user.partner).emit('receive_message', payload);
+        } else if (user.mode === 'room' && user.room) {
+            socket.to(user.room).emit('receive_message', payload);
         }
     });
 
-    // 6. FITUR BARU: Signal Key Exchange (Untuk E2EE)
+    // --- E2EE SIGNAL RELAY ---
     socket.on('signal_key', (keyData) => {
         const user = users[socket.id];
-        if (user && user.partner) {
-            // Teruskan Kunci Publik ke partner tanpa menyimpannya
+        if (!user) return;
+
+        if (user.mode === 'random' && user.partner) {
             io.to(user.partner).emit('signal_key', keyData);
+        } else if (user.mode === 'room' && user.room) {
+            socket.to(user.room).emit('signal_key', { key: keyData, senderId: socket.id });
         }
     });
 
-    // 7. Sistem Report & Auto Ban
-    socket.on('rate_partner', ({ action }) => {
+    // --- DATA SYNC RELAY (ROOM) ---
+    socket.on('send_history_data', ({ targetId, history }) => {
+        io.to(targetId).emit('receive_history_sync', history);
+    });
+
+    // --- REPORT & DISCONNECT ---
+    socket.on('report_partner', () => {
         const user = users[socket.id];
-        if (!user || !user.partner) return;
+        let targetId = user.mode === 'random' ? user.partner : null; 
         
-        const partnerSocketId = user.partner;
-        const partner = users[partnerSocketId];
-        
-        if (action === 'report') {
-            partner.reportCount += 1;
+        if(targetId && users[targetId]) {
+            users[targetId].reportCount++;
             socket.emit('system_message', '🚩 Laporan diterima.');
-            
-            // LOGIKA BAN: Jika dilaporkan 3 kali dalam satu sesi
-            if (partner.reportCount >= 3) {
-                bannedIPs.add(partner.ipHash); // Masukkan Hash IP ke daftar hitam
-                io.to(partnerSocketId).emit('system_message', '🚫 Anda telah di-banned karena perilaku buruk.');
-                io.sockets.sockets.get(partnerSocketId)?.disconnect(true); // Tendang user
+            if(users[targetId].reportCount >= 3) {
+                bannedIPs.add(users[targetId].ipHash);
+                io.sockets.sockets.get(targetId)?.disconnect(true);
             }
-        } else if (action === 'like') {
-            io.to(partnerSocketId).emit('system_message', '👍 Partner memberikan jempol!');
-        }
-    });
-
-    // 8. Fitur Lain
-    socket.on('typing', () => {
-        const user = users[socket.id];
-        if (user && user.partner) io.to(user.partner).emit('partner_typing');
-    });
-
-    socket.on('stop_typing', () => {
-        const user = users[socket.id];
-        if (user && user.partner) io.to(user.partner).emit('partner_stop_typing');
-    });
-
-    socket.on('reveal_identity', () => {
-        const user = users[socket.id];
-        if (user && user.partner) {
-            user.revealed = true;
-            io.to(user.partner).emit('partner_revealed', { nickname: user.nickname });
-            socket.emit('system_message', '🔓 Identitas terungkap.');
         }
     });
 
     socket.on('disconnect', () => {
-        handleDisconnect(socket.id);
+        leaveCurrentState(socket);
+        delete users[socket.id];
         io.emit('update_user_count', io.engine.clientsCount);
     });
 });
 
-function handleDisconnect(socketId) {
-    const user = users[socketId];
+function leaveCurrentState(socket) {
+    const user = users[socket.id];
     if (user) {
-        if (queue[user.country]) {
-            queue[user.country] = queue[user.country].filter(id => id !== socketId);
+        if (user.mode === 'random') {
+            if (queue[user.country]) queue[user.country] = queue[user.country].filter(id => id !== socket.id);
+            if (user.partner) {
+                io.to(user.partner).emit('partner_left');
+                const partner = users[user.partner];
+                if(partner) partner.partner = null;
+            }
+        } else if (user.mode === 'room') {
+            socket.to(user.room).emit('system_message', `❌ ${user.nickname} keluar.`);
+            socket.leave(user.room);
         }
-        if (user.partner && users[user.partner]) {
-            io.to(user.partner).emit('partner_left');
-            users[user.partner].partner = null;
-        }
-        delete users[socketId];
     }
 }
 
-// Gunakan port dari environment variable (penting untuk Glitch/Render)
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-    console.log(`Server berjalan di port ${PORT}`);
-});
+server.listen(PORT, () => console.log(`Server Hybrid running on ${PORT}`));
