@@ -1,15 +1,15 @@
 const express = require('express');
 const http = require('http');
 const { Server } = require("socket.io");
-const crypto = require('crypto');
+const crypto = require('crypto'); // Library untuk Hash IP
 
 const app = express();
 const server = http.createServer(app);
 
-// Konfigurasi CORS & Buffer Size (Naikkan ke 5MB agar fallback gambar aman)
+// Konfigurasi CORS & Buffer Size
 const io = new Server(server, {
     cors: { origin: "*", methods: ["GET", "POST"] },
-    maxHttpBufferSize: 5e6 
+    maxHttpBufferSize: 5e6 // Max 5 MB
 });
 
 app.get('/', (req, res) => res.send("AnonChat P2P Server Running (Complete Ver)"));
@@ -21,8 +21,9 @@ const BAD_WORDS = ["kasar", "bodoh", "anjing", "stupid", "tolol", "bangsat"]; //
 // --- DATABASE SEMENTARA (MEMORY) ---
 let queue = {};     // Antrian Random Match: { 'Indonesia': [socketId1, ...] }
 let rooms = {};     // Room Storage: { 'roomId': [socketId1, socketId2] }
-let users = {};     // User Info: { socketId: { nickname, partner, roomId, mode, ... } }
-let bannedIPs = new Set(); // Blacklist IP
+let users = {};     // User Info: { socketId: { nickname, partner, roomId, mode, deviceId, ... } }
+let bannedIPs = new Set(); // Blacklist IP (Layer 1)
+let bannedDevices = new Set(); // Blacklist Device ID (Layer 2)
 
 // --- FUNGSI BANTUAN ---
 
@@ -49,20 +50,33 @@ function getIpHash(socket) {
 }
 
 io.on('connection', (socket) => {
-    // A. CEK STATUS BANNED
+    // A. CEK STATUS BANNED (Layer 1: IP Check saat koneksi awal)
     const userIpHash = getIpHash(socket);
     if (bannedIPs.has(userIpHash)) {
-        socket.emit('system_message', '🚫 Perangkat Anda diblokir permanen.');
+        socket.emit('system_message', '🚫 Akses Ditolak: IP Anda telah diblokir.');
         socket.disconnect(true);
         return;
     }
 
     io.emit('update_user_count', io.engine.clientsCount);
 
+    // --- MIDDLEWARE CEK DEVICE ID (Layer 2: Device Check saat aksi) ---
+    // Fungsi ini dipanggil setiap kali user ingin melakukan aksi (find match/create room)
+    const checkDeviceBan = (deviceId) => {
+        if (deviceId && bannedDevices.has(deviceId)) {
+            socket.emit('system_message', '🚫 Akses Ditolak: Perangkat Anda telah diblokir permanen.');
+            socket.disconnect(true);
+            return true; // Terblokir
+        }
+        return false; // Aman
+    };
+
     // B. LOGIKA MATCHMAKING
 
-    // 1. Random Match (dengan Logika Interest Sederhana)
-    socket.on('find_match', ({ nickname, country, interests }) => {
+    // 1. Random Match (dengan Device ID)
+    socket.on('find_match', ({ nickname, country, interests, deviceId }) => {
+        if(checkDeviceBan(deviceId)) return;
+
         // Parse minat
         const interestList = typeof interests === 'string' ? interests.split(',').map(i => i.trim().toLowerCase()).filter(i => i) : [];
 
@@ -75,14 +89,16 @@ io.on('connection', (socket) => {
             lastMessageTime: 0,
             reportCount: 0,
             revealed: false,
-            ipHash: userIpHash 
+            ipHash: userIpHash,
+            deviceId: deviceId // Simpan Device ID untuk keperluan ban nanti
         };
         
         if (!queue[country]) queue[country] = [];
         
         // Cek apakah ada yang antri
         if (queue[country].length > 0) {
-            // Sederhana: Ambil antrian terdepan (bisa dikembangkan logic interestnya di sini)
+            // Logika Antrian Sederhana: Ambil yang terdepan
+            // (Bisa dikembangkan dengan mencocokkan interests di sini)
             const partnerId = queue[country].shift();
             
             if(users[partnerId]) {
@@ -90,8 +106,12 @@ io.on('connection', (socket) => {
                 users[socket.id].partner = partnerId;
                 users[partnerId].partner = socket.id;
 
-                io.to(socket.id).emit('chat_start', { role: 'initiator', mode: 'random' });
-                io.to(partnerId).emit('chat_start', { role: 'receiver', mode: 'random' });
+                // Hitung kesamaan interest (opsional, untuk info ke user)
+                const partnerInterests = users[partnerId].interests;
+                const commonTags = partnerInterests.filter(x => interestList.includes(x));
+
+                io.to(socket.id).emit('chat_start', { role: 'initiator', mode: 'random', commonTags });
+                io.to(partnerId).emit('chat_start', { role: 'receiver', mode: 'random', commonTags });
             } else {
                 // Jika partner hantu (disconnect saat antri), cari lagi
                 queue[country].push(socket.id);
@@ -104,7 +124,9 @@ io.on('connection', (socket) => {
     });
 
     // 2. Private Room Logic
-    socket.on('create_room', ({ nickname, roomId }) => {
+    socket.on('create_room', ({ nickname, roomId, deviceId }) => {
+        if(checkDeviceBan(deviceId)) return;
+
         if (rooms[roomId]) return socket.emit('waiting', '❌ Room ID sudah terpakai!');
         
         users[socket.id] = { 
@@ -115,7 +137,8 @@ io.on('connection', (socket) => {
             lastMessageTime: 0,
             reportCount: 0,
             revealed: false,
-            ipHash: userIpHash 
+            ipHash: userIpHash,
+            deviceId: deviceId
         };
         
         rooms[roomId] = [socket.id];
@@ -123,7 +146,9 @@ io.on('connection', (socket) => {
         socket.emit('waiting', `✅ Room ${roomId} dibuat. Menunggu teman...`);
     });
 
-    socket.on('join_room', ({ nickname, roomId }) => {
+    socket.on('join_room', ({ nickname, roomId, deviceId }) => {
+        if(checkDeviceBan(deviceId)) return;
+
         const room = rooms[roomId];
         if (!room || room.length === 0) return socket.emit('waiting', '❌ Room tidak ditemukan.');
         if (room.length >= 2) return socket.emit('waiting', '❌ Room penuh!');
@@ -138,7 +163,8 @@ io.on('connection', (socket) => {
             lastMessageTime: 0,
             reportCount: 0,
             revealed: false,
-            ipHash: userIpHash 
+            ipHash: userIpHash,
+            deviceId: deviceId
         };
         
         users[hostId].partner = socket.id;
@@ -172,14 +198,16 @@ io.on('connection', (socket) => {
 
         try {
             // Parsing JSON payload dari client
-            // Payload format: { type: 'text', content: '...', sender: '...' }
             let payload = JSON.parse(payloadStr);
 
             // MODERASI (Hanya jika tipe text)
             if (payload.type === 'text') {
                 // Escape HTML & Filter Bad Words
                 let safeContent = escapeHtml(payload.content);
-                safeContent = filterBadWords(safeContent);
+                // Jangan filter jika pesan terenkripsi (opsional, tergantung implementasi e2ee)
+                if (!payload.content.startsWith("ENC:")) {
+                    safeContent = filterBadWords(safeContent);
+                }
                 
                 payload.content = safeContent;
                 
@@ -218,10 +246,13 @@ io.on('connection', (socket) => {
             });
             io.to(user.partner).emit('receive_message', sysMsg);
             socket.emit('receive_message', sysMsg);
+            
+            // Event khusus untuk update UI (opsional, tergantung frontend)
+            io.to(user.partner).emit('partner_revealed', { nickname: user.nickname });
         }
     });
 
-    // Sistem Report & Auto Ban
+    // Sistem Report & Auto Ban (Dengan Device ID)
     socket.on('rate_partner', ({ action }) => {
         const user = users[socket.id];
         if (!user || !user.partner) return;
@@ -233,13 +264,21 @@ io.on('connection', (socket) => {
             partner.reportCount += 1;
             socket.emit('system_message', '🚩 Laporan diterima. Terima kasih.');
             
-            // Ban jika dilaporkan 3 kali
+            // Ban jika dilaporkan 3 kali dalam sesi ini
             if (partner.reportCount >= 3) {
+                // Ban IP (Layer 1)
                 bannedIPs.add(partner.ipHash);
-                io.to(partnerSocketId).emit('system_message', '🚫 Anda diblokir karena laporan berulang.');
+                
+                // Ban Device ID (Layer 2) - Lebih spesifik
+                if (partner.deviceId) {
+                    bannedDevices.add(partner.deviceId);
+                }
+
+                io.to(partnerSocketId).emit('system_message', '🚫 Anda diblokir karena laporan berulang dari pengguna lain.');
                 io.sockets.sockets.get(partnerSocketId)?.disconnect(true);
             }
         }
+        // Fitur Like dihapus sesuai request, tapi handler bisa dibiarkan kosong atau dihapus
     });
 
     // E. DISCONNECT HANDLING
