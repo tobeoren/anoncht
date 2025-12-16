@@ -1,7 +1,7 @@
 const express = require('express');
 const http = require('http');
 const { Server } = require("socket.io");
-const helpers = require('./helpers'); // Import Helpers
+const helpers = require('./helpers'); // Import Helpers dari file terpisah
 
 const app = express();
 const server = http.createServer(app);
@@ -11,19 +11,19 @@ const io = new Server(server, {
     maxHttpBufferSize: 5e6 
 });
 
-app.get('/', (req, res) => res.send("AnonChat Server v3.0 (Group & Modular)"));
+app.get('/', (req, res) => res.send("AnonChat Server v3.1 (Modular)"));
 
 const RATE_LIMIT_MS = 500;
 
 // --- DATABASE MEMORY ---
 let queue = {};     
-let rooms = {};     // { roomId: { users: [], max: 10, admin: socketId } }
+let rooms = {};     
 let users = {};     
 let bannedIPs = new Set(); 
 let bannedDevices = new Set();
 
 io.on('connection', (socket) => {
-    // 1. Cek Banned IP
+    // 1. Cek Banned IP (Layer 1) - Menggunakan helper
     const userIpHash = helpers.getIpHash(socket);
     if (bannedIPs.has(userIpHash)) {
         socket.emit('system_message', '🚫 Akses Ditolak: IP Anda diblokir.');
@@ -33,7 +33,7 @@ io.on('connection', (socket) => {
 
     io.emit('update_user_count', io.engine.clientsCount);
 
-    // Fungsi Cek Banned Device
+    // Fungsi Cek Banned Device (Layer 2)
     const checkDeviceBan = (deviceId) => {
         if (deviceId && bannedDevices.has(deviceId)) {
             socket.emit('system_message', '🚫 Akses Ditolak: Perangkat diblokir.');
@@ -82,9 +82,7 @@ io.on('connection', (socket) => {
         }
     });
 
-    // --- B. ROOM LOGIC (GROUP) ---
-    
-    // Create Room
+    // --- B. ROOM LOGIC ---
     socket.on('create_room', ({ nickname, roomId, deviceId, capacity }) => {
         if(checkDeviceBan(deviceId)) return;
         if (rooms[roomId]) return socket.emit('waiting', '❌ Room ID sudah terpakai!');
@@ -100,7 +98,7 @@ io.on('connection', (socket) => {
             mode: 'room', 
             roomId, 
             roomAlias, 
-            role: 'Admin', // Creator = Admin
+            role: 'Admin', 
             lastMessageTime: 0,
             reportCount: 0,
             ipHash: userIpHash,
@@ -127,7 +125,6 @@ io.on('connection', (socket) => {
         socket.emit('system_message', `🎭 Alias kamu: ${roomAlias}`);
     });
 
-    // Join Room
     socket.on('join_room', ({ nickname, roomId, deviceId }) => {
         if(checkDeviceBan(deviceId)) return;
 
@@ -164,7 +161,6 @@ io.on('connection', (socket) => {
         socket.emit('system_message', `🎭 Alias kamu: ${roomAlias}`);
         socket.to(roomId).emit('system_message', `➕ ${roomAlias} bergabung.`);
         
-        // P2P Trigger (Hanya jika room max 2 orang)
         if (room.max === 2 && room.users.length === 2) {
             const hostId = room.users[0];
             users[socket.id].partner = hostId;
@@ -194,18 +190,23 @@ io.on('connection', (socket) => {
                 payload.content = safeContent;
                 
                 if (user.mode === 'room') {
-                    payload.sender = user.roomAlias; // Gunakan Alias di Room
+                    payload.sender = user.roomAlias;
                     payload.role = user.role; 
                     payload.realNickname = user.revealed ? user.nickname : null;
                 } else {
                     payload.sender = user.revealed ? user.nickname : 'Stranger';
+                }
+
+                // ID Reveal Logic
+                if (user.revealed) {
+                    const rawId = user.deviceId || user.ipHash || "UNKNOWN";
+                    payload.senderId = rawId.substring(0, 8).toUpperCase();
                 }
             }
 
             if (user.mode === 'random' && user.partner) {
                 io.to(user.partner).emit('receive_message', JSON.stringify(payload));
             } else if (user.mode === 'room' && user.roomId) {
-                // Broadcast ke Room (kecuali diri sendiri)
                 socket.to(user.roomId).emit('receive_message', JSON.stringify(payload));
             }
 
@@ -229,13 +230,33 @@ io.on('connection', (socket) => {
             : `🔓 Identitas Terungkap: ${user.nickname}`;
 
         const sysMsg = JSON.stringify({ isSystem: true, content: msgContent });
+        
+        // Data ID untuk Frontend
+        const shortId = (user.deviceId || user.ipHash || "UNKNOWN").substring(0, 8).toUpperCase();
+        const revealData = { nickname: user.nickname, id: shortId };
 
         if (user.mode === 'random' && user.partner) {
             io.to(user.partner).emit('receive_message', sysMsg);
             socket.emit('receive_message', sysMsg);
-            io.to(user.partner).emit('partner_revealed', { nickname: user.nickname, id: user.deviceId.substring(0,6).toUpperCase() });
+            io.to(user.partner).emit('partner_revealed', revealData);
         } else if (user.mode === 'room') {
             io.to(user.roomId).emit('receive_message', sysMsg);
+        }
+    });
+
+    socket.on('rate_partner', ({ action }) => {
+        const user = users[socket.id];
+        if (!user || !user.partner) return;
+        const partner = users[user.partner];
+        
+        if (action === 'report' && partner) {
+            partner.reportCount += 1;
+            socket.emit('system_message', '🚩 Laporan diterima.');
+            if (partner.reportCount >= 3) {
+                bannedIPs.add(partner.ipHash);
+                if (partner.deviceId) bannedDevices.add(partner.deviceId);
+                io.sockets.sockets.get(user.partner)?.disconnect(true);
+            }
         }
     });
 
@@ -274,4 +295,4 @@ io.on('connection', (socket) => {
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`Server v3.0 running port ${PORT}`));
+server.listen(PORT, () => console.log(`Server v3.1 Modular running port ${PORT}`));
