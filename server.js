@@ -1,7 +1,7 @@
 const express = require('express');
 const http = require('http');
 const { Server } = require("socket.io");
-const helpers = require('./helpers'); // Import Helpers dari file terpisah
+const helpers = require('./helpers'); // Pastikan file helpers.js ada
 
 const app = express();
 const server = http.createServer(app);
@@ -11,7 +11,7 @@ const io = new Server(server, {
     maxHttpBufferSize: 5e6 
 });
 
-app.get('/', (req, res) => res.send("AnonChat Server v3.1 (Modular)"));
+app.get('/', (req, res) => res.send("AnonChat Server v3.2 (Fix Random P2P)"));
 
 const RATE_LIMIT_MS = 500;
 
@@ -23,7 +23,7 @@ let bannedIPs = new Set();
 let bannedDevices = new Set();
 
 io.on('connection', (socket) => {
-    // 1. Cek Banned IP (Layer 1) - Menggunakan helper
+    // 1. Cek Banned IP
     const userIpHash = helpers.getIpHash(socket);
     if (bannedIPs.has(userIpHash)) {
         socket.emit('system_message', '🚫 Akses Ditolak: IP Anda diblokir.');
@@ -33,7 +33,6 @@ io.on('connection', (socket) => {
 
     io.emit('update_user_count', io.engine.clientsCount);
 
-    // Fungsi Cek Banned Device (Layer 2)
     const checkDeviceBan = (deviceId) => {
         if (deviceId && bannedDevices.has(deviceId)) {
             socket.emit('system_message', '🚫 Akses Ditolak: Perangkat diblokir.');
@@ -43,11 +42,12 @@ io.on('connection', (socket) => {
         return false; 
     };
 
-    // --- A. RANDOM MATCH ---
+    // --- A. RANDOM MATCH (UPDATED: With Alias) ---
     socket.on('find_match', ({ nickname, country, interests, deviceId }) => {
         if(checkDeviceBan(deviceId)) return;
 
         const interestList = typeof interests === 'string' ? interests.split(',').map(i => i.trim().toLowerCase()).filter(i => i) : [];
+        const randomAlias = helpers.generateRoomAlias(); // Generate Alias untuk Random Mode juga
 
         users[socket.id] = { 
             nickname: helpers.escapeHtml(nickname), 
@@ -55,6 +55,7 @@ io.on('connection', (socket) => {
             interests: interestList,
             partner: null, 
             mode: 'random',
+            roomAlias: randomAlias, // Simpan alias
             lastMessageTime: 0,
             reportCount: 0,
             revealed: false,
@@ -70,8 +71,20 @@ io.on('connection', (socket) => {
                 users[socket.id].partner = partnerId;
                 users[partnerId].partner = socket.id;
                 
-                io.to(socket.id).emit('chat_start', { role: 'initiator', mode: 'random' });
-                io.to(partnerId).emit('chat_start', { role: 'receiver', mode: 'random' });
+                // Kirim Alias masing-masing ke Client
+                io.to(socket.id).emit('chat_start', { 
+                    role: 'initiator', 
+                    mode: 'random', 
+                    myAlias: users[socket.id].roomAlias,
+                    partnerAlias: users[partnerId].roomAlias 
+                });
+                
+                io.to(partnerId).emit('chat_start', { 
+                    role: 'receiver', 
+                    mode: 'random',
+                    myAlias: users[partnerId].roomAlias,
+                    partnerAlias: users[socket.id].roomAlias
+                });
             } else {
                 queue[country].push(socket.id);
                 socket.emit('waiting', `Mencari partner di ${country}...`);
@@ -105,12 +118,7 @@ io.on('connection', (socket) => {
             deviceId: deviceId
         };
         
-        rooms[roomId] = {
-            users: [socket.id],
-            max: maxUsers,
-            admin: socket.id
-        };
-        
+        rooms[roomId] = { users: [socket.id], max: maxUsers, admin: socket.id };
         socket.join(roomId);
         
         socket.emit('chat_start', { 
@@ -121,8 +129,7 @@ io.on('connection', (socket) => {
             myAlias: roomAlias
         });
         
-        socket.emit('system_message', `✅ Room dibuat. Kapasitas: ${maxUsers} orang.`);
-        socket.emit('system_message', `🎭 Alias kamu: ${roomAlias}`);
+        socket.emit('system_message', `✅ Room dibuat. Alias Anda: ${roomAlias}`);
     });
 
     socket.on('join_room', ({ nickname, roomId, deviceId }) => {
@@ -157,8 +164,7 @@ io.on('connection', (socket) => {
             myAlias: roomAlias
         });
 
-        socket.emit('system_message', `✅ Berhasil masuk ke room ${roomId}.`);
-        socket.emit('system_message', `🎭 Alias kamu: ${roomAlias}`);
+        socket.emit('system_message', `✅ Bergabung sebagai ${roomAlias}`);
         socket.to(roomId).emit('system_message', `➕ ${roomAlias} bergabung.`);
         
         if (room.max === 2 && room.users.length === 2) {
@@ -170,7 +176,7 @@ io.on('connection', (socket) => {
         }
     });
 
-    // --- C. MESSAGING ---
+    // --- C. MESSAGING (Standardized Alias) ---
     socket.on('send_message', (payloadStr) => {
         const user = users[socket.id];
         if (!user) return;
@@ -189,15 +195,11 @@ io.on('connection', (socket) => {
                 }
                 payload.content = safeContent;
                 
-                if (user.mode === 'room') {
-                    payload.sender = user.roomAlias;
-                    payload.role = user.role; 
-                    payload.realNickname = user.revealed ? user.nickname : null;
-                } else {
-                    payload.sender = user.revealed ? user.nickname : 'Stranger';
-                }
+                // SELALU gunakan Alias sebagai pengirim, kecuali Reveal
+                payload.sender = user.roomAlias; 
+                payload.role = user.role || 'User'; 
+                payload.realNickname = user.revealed ? user.nickname : null;
 
-                // ID Reveal Logic
                 if (user.revealed) {
                     const rawId = user.deviceId || user.ipHash || "UNKNOWN";
                     payload.senderId = rawId.substring(0, 8).toUpperCase();
@@ -213,7 +215,7 @@ io.on('connection', (socket) => {
         } catch (e) { console.error("Msg error:", e); }
     });
 
-    // --- D. SIGNALING (P2P) ---
+    // --- D. SIGNALING ---
     socket.on('signal', (data) => {
         const user = users[socket.id];
         if (user && user.partner) io.to(user.partner).emit('signal', data);
@@ -225,13 +227,10 @@ io.on('connection', (socket) => {
         if (!user) return;
 
         user.revealed = true;
-        const msgContent = user.mode === 'room' 
-            ? `🔓 ${user.roomAlias} adalah ${user.nickname}` 
-            : `🔓 Identitas Terungkap: ${user.nickname}`;
-
+        // Pesan Reveal sekarang konsisten
+        const msgContent = `🔓 ${user.roomAlias} reveal sebagai: ${user.nickname}`;
         const sysMsg = JSON.stringify({ isSystem: true, content: msgContent });
         
-        // Data ID untuk Frontend
         const shortId = (user.deviceId || user.ipHash || "UNKNOWN").substring(0, 8).toUpperCase();
         const revealData = { nickname: user.nickname, id: shortId };
 
@@ -276,10 +275,8 @@ io.on('connection', (socket) => {
                 if(r) {
                     r.users = r.users.filter(id => id !== socket.id);
                     socket.to(user.roomId).emit('system_message', `➖ ${user.roomAlias} keluar.`);
-
-                    if (r.users.length === 0) {
-                        delete rooms[user.roomId]; 
-                    } else if (r.admin === socket.id) {
+                    if (r.users.length === 0) delete rooms[user.roomId]; 
+                    else if (r.admin === socket.id) {
                         r.admin = r.users[0];
                         if(users[r.admin]) {
                             users[r.admin].role = 'Admin';
@@ -295,4 +292,4 @@ io.on('connection', (socket) => {
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`Server v3.1 Modular running port ${PORT}`));
+server.listen(PORT, () => console.log(`Server v3.2 running port ${PORT}`));
