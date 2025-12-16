@@ -1,87 +1,56 @@
 const express = require('express');
 const http = require('http');
 const { Server } = require("socket.io");
-const crypto = require('crypto'); // Library untuk Hash IP
+const helpers = require('./helpers'); // Import Helpers
 
 const app = express();
 const server = http.createServer(app);
 
-// Konfigurasi CORS & Buffer Size
 const io = new Server(server, {
     cors: { origin: "*", methods: ["GET", "POST"] },
-    maxHttpBufferSize: 5e6 // Max 5 MB
+    maxHttpBufferSize: 5e6 
 });
 
-app.get('/', (req, res) => res.send("AnonChat P2P Server Running (Complete Ver)"));
+app.get('/', (req, res) => res.send("AnonChat Server v2.1 (Modular)"));
 
-// --- KONFIGURASI KEAMANAN ---
-const RATE_LIMIT_MS = 500; // Batas kecepatan chat (Anti-spam)
-const BAD_WORDS = ["kasar", "bodoh", "anjing", "stupid", "tolol", "bangsat"]; // Tambahkan kata lain di sini
+const RATE_LIMIT_MS = 500;
 
-// --- DATABASE SEMENTARA (MEMORY) ---
-let queue = {};     // Antrian Random Match: { 'Indonesia': [socketId1, ...] }
-let rooms = {};     // Room Storage: { 'roomId': [socketId1, socketId2] }
-let users = {};     // User Info: { socketId: { nickname, partner, roomId, mode, deviceId, ... } }
-let bannedIPs = new Set(); // Blacklist IP (Layer 1)
-let bannedDevices = new Set(); // Blacklist Device ID (Layer 2)
-
-// --- FUNGSI BANTUAN ---
-
-// 1. Sanitasi HTML (Mencegah XSS)
-function escapeHtml(text) {
-    if (!text) return text;
-    return text.replace(/[&<>"']/g, (m) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;' })[m]);
-}
-
-// 2. Sensor Kata Kasar
-function filterBadWords(text) {
-    let cleanText = text;
-    BAD_WORDS.forEach(word => {
-        const regex = new RegExp(`\\b${word}\\b`, "gi");
-        cleanText = cleanText.replace(regex, "***");
-    });
-    return cleanText;
-}
-
-// 3. Hash IP (Privasi)
-function getIpHash(socket) {
-    const ip = socket.handshake.headers['x-forwarded-for'] || socket.handshake.address;
-    return crypto.createHash('sha256').update(ip).digest('hex');
-}
+// --- DATABASE MEMORY ---
+let queue = {};     
+let rooms = {};     
+let users = {};     
+let bannedIPs = new Set(); 
+let bannedDevices = new Set();
 
 io.on('connection', (socket) => {
-    // A. CEK STATUS BANNED (Layer 1: IP Check saat koneksi awal)
-    const userIpHash = getIpHash(socket);
+    // 1. Cek Banned IP (Layer 1)
+    const userIpHash = helpers.getIpHash(socket);
     if (bannedIPs.has(userIpHash)) {
-        socket.emit('system_message', '🚫 Akses Ditolak: IP Anda telah diblokir.');
+        socket.emit('system_message', '🚫 Akses Ditolak: IP Anda diblokir.');
         socket.disconnect(true);
         return;
     }
 
     io.emit('update_user_count', io.engine.clientsCount);
 
-    // --- MIDDLEWARE CEK DEVICE ID (Layer 2: Device Check saat aksi) ---
-    // Fungsi ini dipanggil setiap kali user ingin melakukan aksi (find match/create room)
+    // Fungsi Cek Banned Device (Layer 2)
     const checkDeviceBan = (deviceId) => {
         if (deviceId && bannedDevices.has(deviceId)) {
-            socket.emit('system_message', '🚫 Akses Ditolak: Perangkat Anda telah diblokir permanen.');
+            socket.emit('system_message', '🚫 Akses Ditolak: Perangkat diblokir.');
             socket.disconnect(true);
-            return true; // Terblokir
+            return true; 
         }
-        return false; // Aman
+        return false; 
     };
 
-    // B. LOGIKA MATCHMAKING
-
-    // 1. Random Match (dengan Device ID)
+    // --- A. RANDOM MATCH ---
     socket.on('find_match', ({ nickname, country, interests, deviceId }) => {
         if(checkDeviceBan(deviceId)) return;
 
-        // Parse minat
         const interestList = typeof interests === 'string' ? interests.split(',').map(i => i.trim().toLowerCase()).filter(i => i) : [];
 
         users[socket.id] = { 
-            nickname: escapeHtml(nickname), 
+            nickname: helpers.escapeHtml(nickname), 
             country, 
             interests: interestList,
             partner: null, 
@@ -90,25 +59,19 @@ io.on('connection', (socket) => {
             reportCount: 0,
             revealed: false,
             ipHash: userIpHash,
-            deviceId: deviceId // Simpan Device ID untuk keperluan ban nanti
+            deviceId: deviceId
         };
         
         if (!queue[country]) queue[country] = [];
         
-        // Cek apakah ada yang antri
         if (queue[country].length > 0) {
             const partnerId = queue[country].shift();
-            
             if(users[partnerId]) {
-                // Match Found!
                 users[socket.id].partner = partnerId;
                 users[partnerId].partner = socket.id;
-
-                const partnerInterests = users[partnerId].interests;
-                const commonTags = partnerInterests.filter(x => interestList.includes(x));
-
-                io.to(socket.id).emit('chat_start', { role: 'initiator', mode: 'random', commonTags });
-                io.to(partnerId).emit('chat_start', { role: 'receiver', mode: 'random', commonTags });
+                
+                io.to(socket.id).emit('chat_start', { role: 'initiator', mode: 'random' });
+                io.to(partnerId).emit('chat_start', { role: 'receiver', mode: 'random' });
             } else {
                 queue[country].push(socket.id);
                 socket.emit('waiting', `Mencari partner di ${country}...`);
@@ -119,62 +82,140 @@ io.on('connection', (socket) => {
         }
     });
 
-    // 2. Private Room Logic
-    socket.on('create_room', ({ nickname, roomId, deviceId }) => {
+    // --- B. ROOM LOGIC ---
+    
+    // Create Room
+    socket.on('create_room', ({ nickname, roomId, deviceId, capacity }) => {
         if(checkDeviceBan(deviceId)) return;
-
         if (rooms[roomId]) return socket.emit('waiting', '❌ Room ID sudah terpakai!');
         
+        let maxUsers = parseInt(capacity) || 2;
+        if (maxUsers < 2) maxUsers = 2;
+        if (maxUsers > 1000) maxUsers = 1000;
+
+        const roomAlias = helpers.generateRoomAlias();
+
         users[socket.id] = { 
-            nickname: escapeHtml(nickname), 
-            partner: null, 
+            nickname: helpers.escapeHtml(nickname), 
             mode: 'room', 
             roomId, 
+            roomAlias, 
+            role: 'Admin', 
             lastMessageTime: 0,
             reportCount: 0,
-            revealed: false,
             ipHash: userIpHash,
             deviceId: deviceId
         };
         
-        rooms[roomId] = [socket.id];
+        rooms[roomId] = {
+            users: [socket.id],
+            max: maxUsers,
+            admin: socket.id,
+            created: Date.now()
+        };
+        
         socket.join(roomId);
-        socket.emit('waiting', `✅ Room ${roomId} dibuat. Menunggu teman...`);
+        
+        socket.emit('chat_start', { 
+            mode: 'room', 
+            isGroup: maxUsers > 2, 
+            roomName: roomId,
+            myRole: 'Admin',
+            myAlias: roomAlias
+        });
+        
+        socket.emit('system_message', `✅ Room dibuat. Kapasitas: ${maxUsers} orang.`);
+        socket.emit('system_message', `🎭 Alias kamu: ${roomAlias}`);
     });
 
+    // Join Room
     socket.on('join_room', ({ nickname, roomId, deviceId }) => {
         if(checkDeviceBan(deviceId)) return;
 
         const room = rooms[roomId];
-        if (!room || room.length === 0) return socket.emit('waiting', '❌ Room tidak ditemukan.');
-        if (room.length >= 2) return socket.emit('waiting', '❌ Room penuh!');
+        if (!room) return socket.emit('waiting', '❌ Room tidak ditemukan.');
+        if (room.users.length >= room.max) return socket.emit('waiting', '❌ Room penuh!');
 
-        const hostId = room[0];
-        
+        const roomAlias = helpers.generateRoomAlias();
+
         users[socket.id] = { 
-            nickname: escapeHtml(nickname), 
-            partner: hostId, 
+            nickname: helpers.escapeHtml(nickname), 
             mode: 'room', 
             roomId, 
+            roomAlias,
+            role: 'Member',
             lastMessageTime: 0,
             reportCount: 0,
-            revealed: false,
             ipHash: userIpHash,
             deviceId: deviceId
         };
         
-        users[hostId].partner = socket.id;
-        
-        room.push(socket.id);
+        room.users.push(socket.id);
         socket.join(roomId);
         
-        io.to(hostId).emit('chat_start', { role: 'initiator', mode: 'room' });
-        io.to(socket.id).emit('chat_start', { role: 'receiver', mode: 'room' });
+        socket.emit('chat_start', { 
+            mode: 'room', 
+            isGroup: room.max > 2, 
+            roomName: roomId,
+            myRole: 'Member',
+            myAlias: roomAlias
+        });
+
+        socket.emit('system_message', `✅ Berhasil masuk ke room ${roomId}.`);
+        socket.emit('system_message', `🎭 Alias kamu: ${roomAlias}`);
+        socket.to(roomId).emit('system_message', `➕ ${roomAlias} bergabung.`);
+        
+        // P2P Trigger (Hanya jika room max 2 orang)
+        if (room.max === 2 && room.users.length === 2) {
+            const hostId = room.users[0];
+            users[socket.id].partner = hostId;
+            users[hostId].partner = socket.id;
+            
+            io.to(hostId).emit('p2p_init', { role: 'initiator' });
+            io.to(socket.id).emit('p2p_init', { role: 'receiver' });
+        }
     });
 
-    // C. FITUR UTAMA (Relay & Signal)
+    // --- C. MESSAGING ---
+    socket.on('send_message', (payloadStr) => {
+        const user = users[socket.id];
+        if (!user) return;
 
-    // 1. WebRTC Signaling (Jembatan P2P)
+        const now = Date.now();
+        if (now - user.lastMessageTime < RATE_LIMIT_MS) return;
+        user.lastMessageTime = now;
+
+        try {
+            let payload = JSON.parse(payloadStr);
+            
+            if (payload.type === 'text') {
+                let safeContent = helpers.escapeHtml(payload.content);
+                if (!payload.content.startsWith("ENC:")) {
+                    safeContent = helpers.filterBadWords(safeContent);
+                }
+                payload.content = safeContent;
+                
+                if (user.mode === 'room') {
+                    payload.sender = user.roomAlias;
+                    payload.role = user.role; 
+                    payload.realNickname = user.revealed ? user.nickname : null;
+                } else {
+                    payload.sender = user.revealed ? user.nickname : 'Stranger';
+                }
+            }
+
+            if (user.mode === 'random' && user.partner) {
+                io.to(user.partner).emit('receive_message', JSON.stringify(payload));
+            } else if (user.mode === 'room' && user.roomId) {
+                socket.to(user.roomId).emit('receive_message', JSON.stringify(payload));
+            }
+
+        } catch (e) {
+            console.error("Msg error:", e);
+        }
+    });
+
+    // --- D. SIGNALING (P2P) ---
     socket.on('signal', (data) => {
         const user = users[socket.id];
         if (user && user.partner) {
@@ -182,115 +223,53 @@ io.on('connection', (socket) => {
         }
     });
 
-    // 2. Relay Message (Fallback jika P2P Gagal + MODERASI)
-    socket.on('send_message', (payloadStr) => {
-        const user = users[socket.id];
-        if (!user || !user.partner) return;
-
-        // Rate Limit Check
-        const now = Date.now();
-        if (now - user.lastMessageTime < RATE_LIMIT_MS) return;
-        user.lastMessageTime = now;
-
-        try {
-            // Parsing JSON payload dari client
-            let payload = JSON.parse(payloadStr);
-
-            // MODERASI (Hanya jika tipe text)
-            if (payload.type === 'text') {
-                let safeContent = escapeHtml(payload.content);
-                // Jangan filter jika pesan terenkripsi
-                if (!payload.content.startsWith("ENC:")) {
-                    safeContent = filterBadWords(safeContent);
-                }
-                
-                payload.content = safeContent;
-                payload.sender = user.revealed ? user.nickname : 'Stranger';
-            }
-
-            // Kemas ulang dan kirim ke partner
-            io.to(user.partner).emit('receive_message', JSON.stringify(payload));
-
-        } catch (e) {
-            console.error("Error parsing message relay:", e);
-        }
-    });
-
-    // D. FITUR SOSIAL (Typing, Reveal, Report)
-
-    socket.on('typing', () => {
-        const user = users[socket.id];
-        if (user && user.partner) io.to(user.partner).emit('partner_typing');
-    });
-
-    socket.on('stop_typing', () => {
-        const user = users[socket.id];
-        if (user && user.partner) io.to(user.partner).emit('partner_stop_typing');
-    });
-
+    // --- E. SOCIAL & ADMIN ---
     socket.on('reveal_identity', () => {
         const user = users[socket.id];
-        if (user && user.partner) {
-            user.revealed = true;
-            // Kirim notifikasi sistem ke kedua belah pihak
-            const sysMsg = JSON.stringify({
-                isSystem: true,
-                content: `🔓 Identitas Terungkap: ${user.nickname}`
-            });
+        if (!user) return;
+
+        user.revealed = true;
+        const msgContent = user.mode === 'room' 
+            ? `🔓 ${user.roomAlias} adalah ${user.nickname}` 
+            : `🔓 Identitas Terungkap: ${user.nickname}`;
+
+        const sysMsg = JSON.stringify({ isSystem: true, content: msgContent });
+
+        if (user.mode === 'random' && user.partner) {
             io.to(user.partner).emit('receive_message', sysMsg);
             socket.emit('receive_message', sysMsg);
-            
-            // Generate Short ID untuk ditampilkan
-            const shortId = user.deviceId ? user.deviceId.substring(0, 6).toUpperCase() : 'UNKNOWN';
-
-            // Event khusus untuk update UI Header (Sekarang kirim ID juga)
-            io.to(user.partner).emit('partner_revealed', { 
-                nickname: user.nickname,
-                id: shortId 
-            });
+            io.to(user.partner).emit('partner_revealed', { nickname: user.nickname, id: user.deviceId.substring(0,6).toUpperCase() });
+        } else if (user.mode === 'room') {
+            io.to(user.roomId).emit('receive_message', sysMsg);
         }
     });
 
-    // Sistem Report & Auto Ban (Dengan Device ID)
-    socket.on('rate_partner', ({ action }) => {
-        const user = users[socket.id];
-        if (!user || !user.partner) return;
-        
-        const partnerSocketId = user.partner;
-        const partner = users[partnerSocketId];
-        
-        if (action === 'report') {
-            partner.reportCount += 1;
-            socket.emit('system_message', '🚩 Laporan diterima. Terima kasih.');
-            
-            // Ban jika dilaporkan 3 kali dalam sesi ini
-            if (partner.reportCount >= 3) {
-                bannedIPs.add(partner.ipHash);
-                
-                if (partner.deviceId) {
-                    bannedDevices.add(partner.deviceId);
-                }
-
-                io.to(partnerSocketId).emit('system_message', '🚫 Anda diblokir karena laporan berulang dari pengguna lain.');
-                io.sockets.sockets.get(partnerSocketId)?.disconnect(true);
-            }
-        }
-    });
-
-    // E. DISCONNECT HANDLING
+    // --- F. DISCONNECT ---
     socket.on('disconnect', () => {
         const user = users[socket.id];
         if (user) {
-            if (user.mode === 'random' && queue[user.country]) {
-                queue[user.country] = queue[user.country].filter(id => id !== socket.id);
+            if (user.mode === 'random') {
+                if (queue[user.country]) queue[user.country] = queue[user.country].filter(id => id !== socket.id);
+                if (user.partner && users[user.partner]) {
+                    io.to(user.partner).emit('partner_left');
+                    users[user.partner].partner = null;
+                }
             }
-            if (user.mode === 'room' && user.roomId && rooms[user.roomId]) {
-                rooms[user.roomId] = rooms[user.roomId].filter(id => id !== socket.id);
-                if(rooms[user.roomId].length === 0) delete rooms[user.roomId];
-            }
-            if (user.partner && users[user.partner]) {
-                io.to(user.partner).emit('partner_left');
-                users[user.partner].partner = null;
+            else if (user.mode === 'room' && user.roomId && rooms[user.roomId]) {
+                const r = rooms[user.roomId];
+                r.users = r.users.filter(id => id !== socket.id);
+                
+                socket.to(user.roomId).emit('system_message', `➖ ${user.roomAlias} keluar.`);
+
+                if (r.users.length === 0) {
+                    delete rooms[user.roomId]; 
+                } else if (r.admin === socket.id) {
+                    r.admin = r.users[0];
+                    if(users[r.admin]) {
+                        users[r.admin].role = 'Admin';
+                        io.to(r.admin).emit('system_message', '👑 Anda sekarang adalah Admin Room!');
+                    }
+                }
             }
             delete users[socket.id];
         }
@@ -299,4 +278,4 @@ io.on('connection', (socket) => {
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`Server Complete running on port ${PORT}`));
+server.listen(PORT, () => console.log(`Server v2.1 running port ${PORT}`));
