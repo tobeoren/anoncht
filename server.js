@@ -9,23 +9,21 @@ const server = http.createServer(app);
 // Konfigurasi CORS & Limit Payload
 const io = new Server(server, {
     cors: { origin: "*", methods: ["GET", "POST"] },
-    maxHttpBufferSize: 5e6 // Limit 5MB (Cukup untuk dokumen/voice note)
+    maxHttpBufferSize: 5e6 // Limit 5MB
 });
 
 app.get('/', (req, res) => res.send("Server Hybrid (Random + Room) Berjalan."));
 
 // --- DATABASE MEMORY ---
-let queue = {}; // Random Queue: { 'Indonesia': [socketId1, ...] }
+let queue = {}; // Random Queue
 let users = {}; // User Data
 let bannedIPs = new Set(); 
 
-// Hash IP untuk Privasi
 function getIpHash(socket) {
     const ip = socket.handshake.headers['x-forwarded-for'] || socket.handshake.address;
     return crypto.createHash('sha256').update(ip).digest('hex');
 }
 
-// Anti XSS Sederhana
 function escapeHtml(text) {
     return text ? text.replace(/[&<>"']/g, m => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;' })[m]) : text;
 }
@@ -42,10 +40,10 @@ io.on('connection', (socket) => {
 
     io.emit('update_user_count', io.engine.clientsCount);
 
-    // --- MODE A: RANDOM MATCHMAKING ---
+    // --- MODE A: RANDOM MATCHMAKING (PERBAIKAN NAMA EVENT) ---
+    // Di app.js emit 'find_random_match', jadi disini harus sama
     socket.on('find_random_match', ({ nickname, country, interests }) => {
-        // Reset state jika user sebelumnya di room
-        leaveCurrentState(socket);
+        leaveCurrentState(socket); // Keluar dari room/queue sebelumnya
 
         users[socket.id] = { 
             nickname: escapeHtml(nickname), 
@@ -76,14 +74,13 @@ io.on('connection', (socket) => {
         if (matchIndex > -1) {
             const partnerId = queue[country].splice(matchIndex, 1)[0];
             if (users[partnerId]) {
-                // Link Users
                 users[socketId].partner = partnerId;
                 users[partnerId].partner = socketId;
                 
                 io.to(socketId).emit('chat_start', { mode: 'random', role: 'initiator' });
                 io.to(partnerId).emit('chat_start', { mode: 'random', role: 'receiver' });
             } else {
-                findRandomPartner(socketId, country, myInterests); // Retry jika partner disconnect
+                findRandomPartner(socketId, country, myInterests);
             }
         } else {
             queue[country].push(socketId);
@@ -108,7 +105,7 @@ io.on('connection', (socket) => {
 
         socket.to(roomID).emit('system_message', `👋 ${nickname} bergabung.`);
         
-        // P2P Sync Trigger (Minta history ke user lama)
+        // P2P Sync Trigger
         const clients = io.sockets.adapter.rooms.get(roomID);
         if (clients && clients.size > 1) {
             const otherSocketId = [...clients].find(id => id !== socket.id);
@@ -128,7 +125,7 @@ io.on('connection', (socket) => {
             sender: user.nickname,
             type: data.type || 'text',
             fileData: data.fileData,
-            timer: data.timer // Untuk fitur Burn Message
+            timer: data.timer
         };
 
         if (user.mode === 'random' && user.partner) {
@@ -138,28 +135,21 @@ io.on('connection', (socket) => {
         }
     });
 
-    // --- E2EE SIGNAL RELAY ---
+    // --- E2EE & REPORT ---
     socket.on('signal_key', (keyData) => {
         const user = users[socket.id];
         if (!user) return;
-
-        if (user.mode === 'random' && user.partner) {
-            io.to(user.partner).emit('signal_key', keyData);
-        } else if (user.mode === 'room' && user.room) {
-            socket.to(user.room).emit('signal_key', { key: keyData, senderId: socket.id });
-        }
+        if (user.mode === 'random' && user.partner) io.to(user.partner).emit('signal_key', keyData);
+        else if (user.mode === 'room' && user.room) socket.to(user.room).emit('signal_key', { key: keyData, senderId: socket.id });
     });
 
-    // --- DATA SYNC RELAY (ROOM) ---
     socket.on('send_history_data', ({ targetId, history }) => {
         io.to(targetId).emit('receive_history_sync', history);
     });
 
-    // --- REPORT & DISCONNECT ---
     socket.on('report_partner', () => {
         const user = users[socket.id];
         let targetId = user.mode === 'random' ? user.partner : null; 
-        
         if(targetId && users[targetId]) {
             users[targetId].reportCount++;
             socket.emit('system_message', '🚩 Laporan diterima.');
@@ -167,6 +157,26 @@ io.on('connection', (socket) => {
                 bannedIPs.add(users[targetId].ipHash);
                 io.sockets.sockets.get(targetId)?.disconnect(true);
             }
+        }
+    });
+
+    // Fitur Typing
+    socket.on('typing', () => {
+        const user = users[socket.id];
+        if (user.mode === 'random' && user.partner) io.to(user.partner).emit('partner_typing');
+        else if (user.mode === 'room' && user.room) socket.to(user.room).emit('partner_typing');
+    });
+
+    socket.on('stop_typing', () => {
+        const user = users[socket.id];
+        if (user.mode === 'random' && user.partner) io.to(user.partner).emit('partner_stop_typing');
+        else if (user.mode === 'room' && user.room) socket.to(user.room).emit('partner_stop_typing');
+    });
+
+    socket.on('reveal_identity', () => {
+        const user = users[socket.id];
+        if (user.mode === 'random' && user.partner) {
+            io.to(user.partner).emit('partner_revealed', { nickname: user.nickname });
         }
     });
 
