@@ -97,8 +97,6 @@ io.on('connection', (socket) => {
         
         // Cek apakah ada yang antri
         if (queue[country].length > 0) {
-            // Logika Antrian Sederhana: Ambil yang terdepan
-            // (Bisa dikembangkan dengan mencocokkan interests di sini)
             const partnerId = queue[country].shift();
             
             if(users[partnerId]) {
@@ -106,14 +104,12 @@ io.on('connection', (socket) => {
                 users[socket.id].partner = partnerId;
                 users[partnerId].partner = socket.id;
 
-                // Hitung kesamaan interest (opsional, untuk info ke user)
                 const partnerInterests = users[partnerId].interests;
                 const commonTags = partnerInterests.filter(x => interestList.includes(x));
 
                 io.to(socket.id).emit('chat_start', { role: 'initiator', mode: 'random', commonTags });
                 io.to(partnerId).emit('chat_start', { role: 'receiver', mode: 'random', commonTags });
             } else {
-                // Jika partner hantu (disconnect saat antri), cari lagi
                 queue[country].push(socket.id);
                 socket.emit('waiting', `Mencari partner di ${country}...`);
             }
@@ -202,16 +198,13 @@ io.on('connection', (socket) => {
 
             // MODERASI (Hanya jika tipe text)
             if (payload.type === 'text') {
-                // Escape HTML & Filter Bad Words
                 let safeContent = escapeHtml(payload.content);
-                // Jangan filter jika pesan terenkripsi (opsional, tergantung implementasi e2ee)
+                // Jangan filter jika pesan terenkripsi
                 if (!payload.content.startsWith("ENC:")) {
                     safeContent = filterBadWords(safeContent);
                 }
                 
                 payload.content = safeContent;
-                
-                // Update nama sender jika reveal aktif (Server-side check)
                 payload.sender = user.revealed ? user.nickname : 'Stranger';
             }
 
@@ -247,8 +240,14 @@ io.on('connection', (socket) => {
             io.to(user.partner).emit('receive_message', sysMsg);
             socket.emit('receive_message', sysMsg);
             
-            // Event khusus untuk update UI (opsional, tergantung frontend)
-            io.to(user.partner).emit('partner_revealed', { nickname: user.nickname });
+            // Generate Short ID untuk ditampilkan
+            const shortId = user.deviceId ? user.deviceId.substring(0, 6).toUpperCase() : 'UNKNOWN';
+
+            // Event khusus untuk update UI Header (Sekarang kirim ID juga)
+            io.to(user.partner).emit('partner_revealed', { 
+                nickname: user.nickname,
+                id: shortId 
+            });
         }
     });
 
@@ -266,10 +265,8 @@ io.on('connection', (socket) => {
             
             // Ban jika dilaporkan 3 kali dalam sesi ini
             if (partner.reportCount >= 3) {
-                // Ban IP (Layer 1)
                 bannedIPs.add(partner.ipHash);
                 
-                // Ban Device ID (Layer 2) - Lebih spesifik
                 if (partner.deviceId) {
                     bannedDevices.add(partner.deviceId);
                 }
@@ -278,23 +275,19 @@ io.on('connection', (socket) => {
                 io.sockets.sockets.get(partnerSocketId)?.disconnect(true);
             }
         }
-        // Fitur Like dihapus sesuai request, tapi handler bisa dibiarkan kosong atau dihapus
     });
 
     // E. DISCONNECT HANDLING
     socket.on('disconnect', () => {
         const user = users[socket.id];
         if (user) {
-            // Bersihkan antrian Random
             if (user.mode === 'random' && queue[user.country]) {
                 queue[user.country] = queue[user.country].filter(id => id !== socket.id);
             }
-            // Bersihkan Room
             if (user.mode === 'room' && user.roomId && rooms[user.roomId]) {
                 rooms[user.roomId] = rooms[user.roomId].filter(id => id !== socket.id);
                 if(rooms[user.roomId].length === 0) delete rooms[user.roomId];
             }
-            // Beritahu Partner
             if (user.partner && users[user.partner]) {
                 io.to(user.partner).emit('partner_left');
                 users[user.partner].partner = null;
