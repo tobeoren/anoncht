@@ -1,197 +1,198 @@
 const express = require('express');
 const http = require('http');
 const { Server } = require("socket.io");
+const crypto = require('crypto');
 
 const app = express();
 const server = http.createServer(app);
-// Set max payload besar agar bisa kirim gambar
+
+// Konfigurasi CORS & Limit Payload
 const io = new Server(server, {
-    maxHttpBufferSize: 1e6 // Max 1 MB per pesan/gambar
+    cors: { origin: "*", methods: ["GET", "POST"] },
+    maxHttpBufferSize: 5e6 // Limit 5MB (Cukup untuk dokumen/voice note)
 });
 
-app.get('/', (req, res) => {
-    res.sendFile(__dirname + '/index.html');
-});
+app.get('/', (req, res) => res.send("Server Hybrid (Random + Room) Berjalan."));
 
-// --- KONFIGURASI ---
-const RATE_LIMIT_MS = 500;
-const BAD_WORDS = ["kasar", "bodoh", "anjing", "stupid"];
+// --- DATABASE MEMORY ---
+let queue = {}; // Random Queue: { 'Indonesia': [socketId1, ...] }
+let users = {}; // User Data
+let bannedIPs = new Set(); 
 
-// --- FUNGSI BANTUAN ---
+// Hash IP untuk Privasi
+function getIpHash(socket) {
+    const ip = socket.handshake.headers['x-forwarded-for'] || socket.handshake.address;
+    return crypto.createHash('sha256').update(ip).digest('hex');
+}
+
+// Anti XSS Sederhana
 function escapeHtml(text) {
-    if (!text) return text;
-    return text.replace(/[&<>"']/g, (m) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;' })[m]);
+    return text ? text.replace(/[&<>"']/g, m => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;' })[m]) : text;
 }
-
-function filterBadWords(text) {
-    let cleanText = text;
-    BAD_WORDS.forEach(word => {
-        const regex = new RegExp(`\\b${word}\\b`, "gi");
-        cleanText = cleanText.replace(regex, "***");
-    });
-    return cleanText;
-}
-
-// --- DATA STORE ---
-let queue = {}; // { 'Indonesia': [socket_id, ...], ... }
-let users = {}; // Data user lengkap
 
 io.on('connection', (socket) => {
-    // 1. Update Online Counter
+    const userIpHash = getIpHash(socket);
+
+    // 1. CEK BANNED
+    if (bannedIPs.has(userIpHash)) {
+        socket.emit('system_message', '🚫 Akses Ditolak: Perangkat diblokir.');
+        socket.disconnect(true);
+        return;
+    }
+
     io.emit('update_user_count', io.engine.clientsCount);
 
-    socket.on('find_match', ({ nickname, country, interests }) => {
-        // Parse interests jadi array lowercase
-        const interestList = interests.split(',').map(i => i.trim().toLowerCase()).filter(i => i);
+    // --- MODE A: RANDOM MATCHMAKING ---
+    socket.on('find_random_match', ({ nickname, country, interests }) => {
+        // Reset state jika user sebelumnya di room
+        leaveCurrentState(socket);
 
         users[socket.id] = { 
             nickname: escapeHtml(nickname), 
-            country: country, 
-            interests: interestList,
+            country, 
+            interests: typeof interests === 'string' ? interests.toLowerCase().split(',') : [],
+            mode: 'random',
             partner: null,
-            revealed: false,
-            lastMessageTime: 0,
-            karma: 100 // Modal awal reputasi
+            ipHash: userIpHash,
+            reportCount: 0
         };
-
-        findPartner(socket.id, country, interestList);
+        findRandomPartner(socket.id, country, users[socket.id].interests);
     });
 
-    // LOGIKA MATCHMAKING DENGAN MINAT
-    function findPartner(socketId, country, myInterests) {
+    function findRandomPartner(socketId, country, myInterests) {
         if (!queue[country]) queue[country] = [];
-        
-        // Cari partner di antrean yang punya minat sama
         let matchIndex = -1;
-        
-        // Prioritas 1: Cari yang minatnya SAMA
+
+        // Prioritas: Minat Sama
         if (myInterests.length > 0) {
-            matchIndex = queue[country].findIndex(waitingId => {
-                const waiter = users[waitingId];
-                if (!waiter) return false;
-                // Cek irisan minat (Intersection)
-                const common = waiter.interests.filter(x => myInterests.includes(x));
-                return common.length > 0;
+            matchIndex = queue[country].findIndex(id => {
+                const waiter = users[id];
+                return waiter && waiter.interests.some(x => myInterests.includes(x));
             });
         }
-
-        // Prioritas 2: Jika tidak ada minat sama, ambil siapa saja (First Come First Serve)
-        if (matchIndex === -1 && queue[country].length > 0) {
-            matchIndex = 0;
-        }
+        // Fallback: Siapa saja
+        if (matchIndex === -1 && queue[country].length > 0) matchIndex = 0;
 
         if (matchIndex > -1) {
-            // MATCH FOUND
             const partnerId = queue[country].splice(matchIndex, 1)[0];
-            
             if (users[partnerId]) {
+                // Link Users
                 users[socketId].partner = partnerId;
                 users[partnerId].partner = socketId;
-
-                // Cek kesamaan minat untuk notifikasi
-                const partnerInterests = users[partnerId].interests;
-                const commonTags = partnerInterests.filter(x => myInterests.includes(x));
-
-                io.to(socketId).emit('chat_start', { role: 'initiator', commonTags });
-                io.to(partnerId).emit('chat_start', { role: 'receiver', commonTags });
+                
+                io.to(socketId).emit('chat_start', { mode: 'random', role: 'initiator' });
+                io.to(partnerId).emit('chat_start', { mode: 'random', role: 'receiver' });
             } else {
-                // Partner hantu, coba lagi
-                findPartner(socketId, country, myInterests);
+                findRandomPartner(socketId, country, myInterests); // Retry jika partner disconnect
             }
         } else {
-            // Tidak ada teman, masuk antrean
             queue[country].push(socketId);
-            socket.emit('waiting', `Mencari teman di ${country}... (Tag: ${myInterests.join(', ') || 'Semua'})`);
+            socket.emit('waiting', `Mencari partner random di ${country}...`);
         }
     }
 
-    // 2. Kirim Pesan Biasa
-    socket.on('send_message', (msg) => {
-        const user = users[socket.id];
-        if (!user || !user.partner) return;
+    // --- MODE B: ROOM CHAT ---
+    socket.on('join_room', ({ roomCode, nickname }) => {
+        leaveCurrentState(socket);
 
-        const now = Date.now();
-        if (now - user.lastMessageTime < RATE_LIMIT_MS) return; // Rate limit
-        user.lastMessageTime = now;
+        const roomID = roomCode.trim().toUpperCase();
+        socket.join(roomID);
+        
+        users[socket.id] = { 
+            nickname: escapeHtml(nickname), 
+            room: roomID, 
+            mode: 'room',
+            ipHash: userIpHash,
+            reportCount: 0
+        };
 
-        let safeMsg = filterBadWords(escapeHtml(msg));
-
-        io.to(user.partner).emit('receive_message', { msg: safeMsg, sender: user.revealed ? user.nickname : 'Stranger', type: 'text' });
-        socket.emit('receive_message', { msg: safeMsg, sender: 'You', isSelf: true, type: 'text' });
+        socket.to(roomID).emit('system_message', `👋 ${nickname} bergabung.`);
+        
+        // P2P Sync Trigger (Minta history ke user lama)
+        const clients = io.sockets.adapter.rooms.get(roomID);
+        if (clients && clients.size > 1) {
+            const otherSocketId = [...clients].find(id => id !== socket.id);
+            if(otherSocketId) io.to(otherSocketId).emit('request_history_sync', { requesterId: socket.id });
+        }
+        
+        socket.emit('chat_start', { mode: 'room', roomName: roomID });
     });
 
-    // 3. Kirim Gambar (Base64)
-    socket.on('send_image', (imgData) => {
+    // --- UNIVERSAL MESSAGING ---
+    socket.on('send_message', (data) => {
         const user = users[socket.id];
-        if (user && user.partner) {
-            io.to(user.partner).emit('receive_message', { msg: imgData, sender: user.revealed ? user.nickname : 'Stranger', type: 'image' });
-            socket.emit('receive_message', { msg: imgData, sender: 'You', isSelf: true, type: 'image' });
+        if (!user) return;
+
+        const payload = {
+            msg: data.msg,
+            sender: user.nickname,
+            type: data.type || 'text',
+            fileData: data.fileData,
+            timer: data.timer // Untuk fitur Burn Message
+        };
+
+        if (user.mode === 'random' && user.partner) {
+            io.to(user.partner).emit('receive_message', payload);
+        } else if (user.mode === 'room' && user.room) {
+            socket.to(user.room).emit('receive_message', payload);
         }
     });
 
-    // 4. Sistem Reputasi (Like & Report)
-    socket.on('rate_partner', ({ action }) => {
+    // --- E2EE SIGNAL RELAY ---
+    socket.on('signal_key', (keyData) => {
         const user = users[socket.id];
-        if (!user || !user.partner) return;
+        if (!user) return;
+
+        if (user.mode === 'random' && user.partner) {
+            io.to(user.partner).emit('signal_key', keyData);
+        } else if (user.mode === 'room' && user.room) {
+            socket.to(user.room).emit('signal_key', { key: keyData, senderId: socket.id });
+        }
+    });
+
+    // --- DATA SYNC RELAY (ROOM) ---
+    socket.on('send_history_data', ({ targetId, history }) => {
+        io.to(targetId).emit('receive_history_sync', history);
+    });
+
+    // --- REPORT & DISCONNECT ---
+    socket.on('report_partner', () => {
+        const user = users[socket.id];
+        let targetId = user.mode === 'random' ? user.partner : null; 
         
-        const partner = users[user.partner];
-        
-        if (action === 'like') {
-            partner.karma += 10;
-            socket.emit('system_message', '👍 Kamu menyukai partner ini.');
-            io.to(user.partner).emit('system_message', '👍 Partner memberikan jempol untukmu!');
-        } else if (action === 'report') {
-            partner.karma -= 50;
-            socket.emit('system_message', '🚩 Laporan diterima. Sistem akan mencatat perilaku partner.');
-            // Jika karma terlalu rendah, bisa ditendang (opsional)
-            if (partner.karma < 0) {
-                 io.to(user.partner).emit('system_message', '⚠️ Peringatan: Anda mendapat banyak laporan buruk.');
+        if(targetId && users[targetId]) {
+            users[targetId].reportCount++;
+            socket.emit('system_message', '🚩 Laporan diterima.');
+            if(users[targetId].reportCount >= 3) {
+                bannedIPs.add(users[targetId].ipHash);
+                io.sockets.sockets.get(targetId)?.disconnect(true);
             }
-        }
-    });
-
-    // 5. Fitur Standar (Typing, Reveal, Disconnect)
-    socket.on('typing', () => {
-        const user = users[socket.id];
-        if (user && user.partner) io.to(user.partner).emit('partner_typing');
-    });
-
-    socket.on('stop_typing', () => {
-        const user = users[socket.id];
-        if (user && user.partner) io.to(user.partner).emit('partner_stop_typing');
-    });
-
-    socket.on('reveal_identity', () => {
-        const user = users[socket.id];
-        if (user && user.partner) {
-            user.revealed = true;
-            io.to(user.partner).emit('partner_revealed', { nickname: user.nickname });
-            socket.emit('system_message', '🔓 Identitas kamu terungkap.');
         }
     });
 
     socket.on('disconnect', () => {
-        handleDisconnect(socket.id);
+        leaveCurrentState(socket);
+        delete users[socket.id];
         io.emit('update_user_count', io.engine.clientsCount);
     });
-
-    socket.on('leave_chat', () => handleDisconnect(socket.id));
 });
 
-function handleDisconnect(socketId) {
-    const user = users[socketId];
+function leaveCurrentState(socket) {
+    const user = users[socket.id];
     if (user) {
-        if (queue[user.country]) {
-            queue[user.country] = queue[user.country].filter(id => id !== socketId);
+        if (user.mode === 'random') {
+            if (queue[user.country]) queue[user.country] = queue[user.country].filter(id => id !== socket.id);
+            if (user.partner) {
+                io.to(user.partner).emit('partner_left');
+                const partner = users[user.partner];
+                if(partner) partner.partner = null;
+            }
+        } else if (user.mode === 'room') {
+            socket.to(user.room).emit('system_message', `❌ ${user.nickname} keluar.`);
+            socket.leave(user.room);
         }
-        if (user.partner && users[user.partner]) {
-            io.to(user.partner).emit('partner_left');
-            users[user.partner].partner = null;
-        }
-        delete users[socketId];
     }
 }
 
-server.listen(3000, () => {
-    console.log('Server berjalan di http://localhost:3000');
-});
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => console.log(`Server Hybrid running on ${PORT}`));
