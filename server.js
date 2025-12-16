@@ -11,19 +11,19 @@ const io = new Server(server, {
     maxHttpBufferSize: 5e6 
 });
 
-app.get('/', (req, res) => res.send("AnonChat Server v2.1 (Modular)"));
+app.get('/', (req, res) => res.send("AnonChat Server v3.0 (Group & Modular)"));
 
 const RATE_LIMIT_MS = 500;
 
 // --- DATABASE MEMORY ---
 let queue = {};     
-let rooms = {};     
+let rooms = {};     // { roomId: { users: [], max: 10, admin: socketId } }
 let users = {};     
 let bannedIPs = new Set(); 
 let bannedDevices = new Set();
 
 io.on('connection', (socket) => {
-    // 1. Cek Banned IP (Layer 1)
+    // 1. Cek Banned IP
     const userIpHash = helpers.getIpHash(socket);
     if (bannedIPs.has(userIpHash)) {
         socket.emit('system_message', '🚫 Akses Ditolak: IP Anda diblokir.');
@@ -33,7 +33,7 @@ io.on('connection', (socket) => {
 
     io.emit('update_user_count', io.engine.clientsCount);
 
-    // Fungsi Cek Banned Device (Layer 2)
+    // Fungsi Cek Banned Device
     const checkDeviceBan = (deviceId) => {
         if (deviceId && bannedDevices.has(deviceId)) {
             socket.emit('system_message', '🚫 Akses Ditolak: Perangkat diblokir.');
@@ -82,7 +82,7 @@ io.on('connection', (socket) => {
         }
     });
 
-    // --- B. ROOM LOGIC ---
+    // --- B. ROOM LOGIC (GROUP) ---
     
     // Create Room
     socket.on('create_room', ({ nickname, roomId, deviceId, capacity }) => {
@@ -100,7 +100,7 @@ io.on('connection', (socket) => {
             mode: 'room', 
             roomId, 
             roomAlias, 
-            role: 'Admin', 
+            role: 'Admin', // Creator = Admin
             lastMessageTime: 0,
             reportCount: 0,
             ipHash: userIpHash,
@@ -110,8 +110,7 @@ io.on('connection', (socket) => {
         rooms[roomId] = {
             users: [socket.id],
             max: maxUsers,
-            admin: socket.id,
-            created: Date.now()
+            admin: socket.id
         };
         
         socket.join(roomId);
@@ -170,7 +169,6 @@ io.on('connection', (socket) => {
             const hostId = room.users[0];
             users[socket.id].partner = hostId;
             users[hostId].partner = socket.id;
-            
             io.to(hostId).emit('p2p_init', { role: 'initiator' });
             io.to(socket.id).emit('p2p_init', { role: 'receiver' });
         }
@@ -196,7 +194,7 @@ io.on('connection', (socket) => {
                 payload.content = safeContent;
                 
                 if (user.mode === 'room') {
-                    payload.sender = user.roomAlias;
+                    payload.sender = user.roomAlias; // Gunakan Alias di Room
                     payload.role = user.role; 
                     payload.realNickname = user.revealed ? user.nickname : null;
                 } else {
@@ -207,20 +205,17 @@ io.on('connection', (socket) => {
             if (user.mode === 'random' && user.partner) {
                 io.to(user.partner).emit('receive_message', JSON.stringify(payload));
             } else if (user.mode === 'room' && user.roomId) {
+                // Broadcast ke Room (kecuali diri sendiri)
                 socket.to(user.roomId).emit('receive_message', JSON.stringify(payload));
             }
 
-        } catch (e) {
-            console.error("Msg error:", e);
-        }
+        } catch (e) { console.error("Msg error:", e); }
     });
 
     // --- D. SIGNALING (P2P) ---
     socket.on('signal', (data) => {
         const user = users[socket.id];
-        if (user && user.partner) {
-            io.to(user.partner).emit('signal', data);
-        }
+        if (user && user.partner) io.to(user.partner).emit('signal', data);
     });
 
     // --- E. SOCIAL & ADMIN ---
@@ -257,17 +252,18 @@ io.on('connection', (socket) => {
             }
             else if (user.mode === 'room' && user.roomId && rooms[user.roomId]) {
                 const r = rooms[user.roomId];
-                r.users = r.users.filter(id => id !== socket.id);
-                
-                socket.to(user.roomId).emit('system_message', `➖ ${user.roomAlias} keluar.`);
+                if(r) {
+                    r.users = r.users.filter(id => id !== socket.id);
+                    socket.to(user.roomId).emit('system_message', `➖ ${user.roomAlias} keluar.`);
 
-                if (r.users.length === 0) {
-                    delete rooms[user.roomId]; 
-                } else if (r.admin === socket.id) {
-                    r.admin = r.users[0];
-                    if(users[r.admin]) {
-                        users[r.admin].role = 'Admin';
-                        io.to(r.admin).emit('system_message', '👑 Anda sekarang adalah Admin Room!');
+                    if (r.users.length === 0) {
+                        delete rooms[user.roomId]; 
+                    } else if (r.admin === socket.id) {
+                        r.admin = r.users[0];
+                        if(users[r.admin]) {
+                            users[r.admin].role = 'Admin';
+                            io.to(r.admin).emit('system_message', '👑 Anda sekarang adalah Admin Room!');
+                        }
                     }
                 }
             }
@@ -278,4 +274,4 @@ io.on('connection', (socket) => {
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`Server v2.1 running port ${PORT}`));
+server.listen(PORT, () => console.log(`Server v3.0 running port ${PORT}`));
