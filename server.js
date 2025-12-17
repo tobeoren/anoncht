@@ -24,11 +24,11 @@ let bannedDevices = new Set();
 
 io.on('connection', (socket) => {
     // 1. Cek Banned Subnet (IP)
-    // PENTING: Kita gunakan nama variabel 'userIpHash' agar konsisten dengan kode di bawah
+    // Menggunakan variabel 'userSubnetHash'
     const userSubnetHash = helpers.getIpHash(socket); 
 
     if (bannedIPs.has(userSubnetHash)) {
-        console.log(`🚫 Blocked connection from banned subnet: ${userIpHash}`);
+        console.log(`🚫 Blocked connection from banned subnet: ${userSubnetHash}`);
         socket.emit('system_message', '🚫 Akses Ditolak: Jaringan internet Anda diblokir.');
         socket.disconnect(true);
         return;
@@ -62,7 +62,8 @@ io.on('connection', (socket) => {
             lastMessageTime: 0,
             reportCount: 0,
             revealed: false,
-            ipHash: userIpHash, // <--- ERROR SEBELUMNYA DISINI (Sekarang sudah aman)
+            // PERBAIKAN: Gunakan nama properti 'subnetHash' agar konsisten
+            subnetHash: userSubnetHash, 
             deviceId: deviceId
         };
         
@@ -116,7 +117,8 @@ io.on('connection', (socket) => {
             role: 'Admin', 
             lastMessageTime: 0,
             reportCount: 0,
-            ipHash: userIpHash, // <--- Menggunakan variabel yang sudah didefinisikan di atas
+            // PERBAIKAN: Konsisten menggunakan subnetHash
+            subnetHash: userSubnetHash, 
             deviceId: deviceId
         };
         
@@ -151,7 +153,8 @@ io.on('connection', (socket) => {
             role: 'Member',
             lastMessageTime: 0,
             reportCount: 0,
-            ipHash: userIpHash, // <--- Menggunakan variabel yang sudah didefinisikan di atas
+            // PERBAIKAN: Konsisten menggunakan subnetHash
+            subnetHash: userSubnetHash, 
             deviceId: deviceId
         };
         
@@ -203,7 +206,8 @@ io.on('connection', (socket) => {
                 payload.realNickname = user.revealed ? user.nickname : null;
 
                 if (user.revealed) {
-                    const rawId = user.deviceId || user.ipHash || "UNKNOWN";
+                    // PERBAIKAN: Gunakan 'user.subnetHash' (konsisten dengan deklarasi di atas)
+                    const rawId = user.deviceId || user.subnetHash || "UNKNOWN";
                     payload.senderId = rawId.substring(0, 8).toUpperCase();
                 }
             }
@@ -240,7 +244,8 @@ io.on('connection', (socket) => {
         const msgContent = `🔓 ${user.roomAlias} reveal sebagai: ${user.nickname}`;
         const sysMsg = JSON.stringify({ isSystem: true, content: msgContent });
         
-        const shortId = (user.deviceId || user.ipHash || "UNKNOWN").substring(0, 8).toUpperCase();
+        // PERBAIKAN: Gunakan 'user.subnetHash'
+        const shortId = (user.deviceId || user.subnetHash || "UNKNOWN").substring(0, 8).toUpperCase();
         const revealData = { nickname: user.nickname, id: shortId };
 
         if (user.mode === 'random' && user.partner) {
@@ -261,7 +266,8 @@ io.on('connection', (socket) => {
             partner.reportCount += 1;
             socket.emit('system_message', '🚩 Laporan diterima.');
             if (partner.reportCount >= 3) {
-                bannedIPs.add(partner.ipHash);
+                // PERBAIKAN: Banned menggunakan subnetHash
+                bannedIPs.add(partner.subnetHash);
                 if (partner.deviceId) bannedDevices.add(partner.deviceId);
                 io.sockets.sockets.get(user.partner)?.disconnect(true);
             }
