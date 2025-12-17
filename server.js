@@ -23,10 +23,11 @@ let bannedIPs = new Set();
 let bannedDevices = new Set();
 
 io.on('connection', (socket) => {
-    // 1. Cek Banned IP
-    const userIpHash = helpers.getIpHash(socket);
-    if (bannedIPs.has(userIpHash)) {
-        socket.emit('system_message', '🚫 Akses Ditolak: IP Anda diblokir.');
+    // 1. Cek Banned Subnet (Level 3)
+    const userSubnetHash = helpers.getIpHash(socket);
+    if (bannedIPs.has(userSubnetHash)) {
+        console.log(`🚫 Blocked connection from banned subnet: ${userSubnetHash}`);
+        socket.emit('system_message', '🚫 Akses Ditolak: Jaringan internet Anda diblokir.');
         socket.disconnect(true);
         return;
     }
@@ -302,4 +303,3 @@ io.on('connection', (socket) => {
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => console.log(`Server v3.2 running port ${PORT}`));
-
