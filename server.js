@@ -289,7 +289,17 @@ io.on('connection', (socket) => {
         }
         io.emit('update_user_count', io.engine.clientsCount);
     });
+
+    // --- G. E2EE KEY EXCHANGE (Baru) ---
+    socket.on('exchange_key', (keyData) => {
+        const user = users[socket.id];
+        // Hanya izinkan pertukaran kunci di mode Random (P2P target)
+        if (user && user.partner && user.mode === 'random') {
+            io.to(user.partner).emit('exchange_key', keyData);
+        }
+    });
 });
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => console.log(`Server v3.2 running port ${PORT}`));
+
