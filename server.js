@@ -11,7 +11,7 @@ const io = new Server(server, {
     maxHttpBufferSize: 5e6 
 });
 
-app.get('/', (req, res) => res.send("AnonChat Server v3.2 (Fix Random P2P)"));
+app.get('/', (req, res) => res.send("AnonChat Server v3.3 (Subnet Ban + E2EE + Fix)"));
 
 const RATE_LIMIT_MS = 500;
 
@@ -23,10 +23,12 @@ let bannedIPs = new Set();
 let bannedDevices = new Set();
 
 io.on('connection', (socket) => {
-    // 1. Cek Banned Subnet (Level 3)
-    const userSubnetHash = helpers.getIpHash(socket);
+    // 1. Cek Banned Subnet (IP)
+    // PENTING: Kita gunakan nama variabel 'userIpHash' agar konsisten dengan kode di bawah
+    const userSubnetHash = helpers.getIpHash(socket); 
+
     if (bannedIPs.has(userSubnetHash)) {
-        console.log(`🚫 Blocked connection from banned subnet: ${userSubnetHash}`);
+        console.log(`🚫 Blocked connection from banned subnet: ${userIpHash}`);
         socket.emit('system_message', '🚫 Akses Ditolak: Jaringan internet Anda diblokir.');
         socket.disconnect(true);
         return;
@@ -48,7 +50,7 @@ io.on('connection', (socket) => {
         if(checkDeviceBan(deviceId)) return;
 
         const interestList = typeof interests === 'string' ? interests.split(',').map(i => i.trim().toLowerCase()).filter(i => i) : [];
-        const randomAlias = helpers.generateRoomAlias(); // Generate Alias untuk Random Mode juga
+        const randomAlias = helpers.generateRoomAlias(); 
 
         users[socket.id] = { 
             nickname: helpers.escapeHtml(nickname), 
@@ -56,11 +58,11 @@ io.on('connection', (socket) => {
             interests: interestList,
             partner: null, 
             mode: 'random',
-            roomAlias: randomAlias, // Simpan alias
+            roomAlias: randomAlias, 
             lastMessageTime: 0,
             reportCount: 0,
             revealed: false,
-            ipHash: userIpHash,
+            ipHash: userIpHash, // <--- ERROR SEBELUMNYA DISINI (Sekarang sudah aman)
             deviceId: deviceId
         };
         
@@ -72,7 +74,6 @@ io.on('connection', (socket) => {
                 users[socket.id].partner = partnerId;
                 users[partnerId].partner = socket.id;
                 
-                // Kirim Alias masing-masing ke Client
                 io.to(socket.id).emit('chat_start', { 
                     role: 'initiator', 
                     mode: 'random', 
@@ -115,7 +116,7 @@ io.on('connection', (socket) => {
             role: 'Admin', 
             lastMessageTime: 0,
             reportCount: 0,
-            ipHash: userIpHash,
+            ipHash: userIpHash, // <--- Menggunakan variabel yang sudah didefinisikan di atas
             deviceId: deviceId
         };
         
@@ -150,7 +151,7 @@ io.on('connection', (socket) => {
             role: 'Member',
             lastMessageTime: 0,
             reportCount: 0,
-            ipHash: userIpHash,
+            ipHash: userIpHash, // <--- Menggunakan variabel yang sudah didefinisikan di atas
             deviceId: deviceId
         };
         
@@ -177,7 +178,7 @@ io.on('connection', (socket) => {
         }
     });
 
-    // --- C. MESSAGING (Standardized Alias) ---
+    // --- C. MESSAGING ---
     socket.on('send_message', (payloadStr) => {
         const user = users[socket.id];
         if (!user) return;
@@ -191,12 +192,12 @@ io.on('connection', (socket) => {
             
             if (payload.type === 'text') {
                 let safeContent = helpers.escapeHtml(payload.content);
+                // Jika pesan terenkripsi (ENC:...), jangan filter bad words (karena tidak terbaca)
                 if (!payload.content.startsWith("ENC:")) {
                     safeContent = helpers.filterBadWords(safeContent);
                 }
                 payload.content = safeContent;
                 
-                // SELALU gunakan Alias sebagai pengirim, kecuali Reveal
                 payload.sender = user.roomAlias; 
                 payload.role = user.role || 'User'; 
                 payload.realNickname = user.revealed ? user.nickname : null;
@@ -216,10 +217,18 @@ io.on('connection', (socket) => {
         } catch (e) { console.error("Msg error:", e); }
     });
 
-    // --- D. SIGNALING ---
+    // --- D. SIGNALING & E2EE KEY EXCHANGE ---
     socket.on('signal', (data) => {
         const user = users[socket.id];
         if (user && user.partner) io.to(user.partner).emit('signal', data);
+    });
+
+    // Listener E2EE (Menukar Kunci Publik)
+    socket.on('exchange_key', (keyData) => {
+        const user = users[socket.id];
+        if (user && user.partner && user.mode === 'random') {
+            io.to(user.partner).emit('exchange_key', keyData);
+        }
     });
 
     // --- E. SOCIAL & ADMIN ---
@@ -228,7 +237,6 @@ io.on('connection', (socket) => {
         if (!user) return;
 
         user.revealed = true;
-        // Pesan Reveal sekarang konsisten
         const msgContent = `🔓 ${user.roomAlias} reveal sebagai: ${user.nickname}`;
         const sysMsg = JSON.stringify({ isSystem: true, content: msgContent });
         
@@ -290,16 +298,7 @@ io.on('connection', (socket) => {
         }
         io.emit('update_user_count', io.engine.clientsCount);
     });
-
-    // --- G. E2EE KEY EXCHANGE (Baru) ---
-    socket.on('exchange_key', (keyData) => {
-        const user = users[socket.id];
-        // Hanya izinkan pertukaran kunci di mode Random (P2P target)
-        if (user && user.partner && user.mode === 'random') {
-            io.to(user.partner).emit('exchange_key', keyData);
-        }
-    });
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`Server v3.2 running port ${PORT}`));
+server.listen(PORT, () => console.log(`Server running port ${PORT}`));
