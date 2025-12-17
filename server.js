@@ -205,6 +205,13 @@ io.on('connection', (socket) => {
                 payload.role = user.role || 'User'; 
                 payload.realNickname = user.revealed ? user.nickname : null;
 
+                    // Kita tidak bisa sensor audio, tapi kita pastikan sender-nya benar
+                if (payload.type === 'audio') {
+                    payload.sender = user.roomAlias; 
+                    payload.role = user.role || 'User';
+                    // ID Reveal logic dll...
+                }
+
                 if (user.revealed) {
                     // PERBAIKAN: Gunakan 'user.subnetHash' (konsisten dengan deklarasi di atas)
                     const rawId = user.deviceId || user.subnetHash || "UNKNOWN";
