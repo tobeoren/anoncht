@@ -205,11 +205,16 @@ io.on('connection', (socket) => {
                 payload.role = user.role || 'User'; 
                 payload.realNickname = user.revealed ? user.nickname : null;
 
-                    // Kita tidak bisa sensor audio, tapi kita pastikan sender-nya benar
+                // LOGIKA AUDIO (Updated)
                 if (payload.type === 'audio') {
                     payload.sender = user.roomAlias; 
                     payload.role = user.role || 'User';
-                    // ID Reveal logic dll...
+                    // Tambahkan ini agar ID muncul di Audio jika sudah reveal
+                    payload.realNickname = user.revealed ? user.nickname : null;
+                    if (user.revealed) {
+                        const rawId = user.deviceId || user.subnetHash || "UNKNOWN";
+                        payload.senderId = rawId.substring(0, 8).toUpperCase();
+                    }
                 }
 
                 if (user.revealed) {
